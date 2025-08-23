@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "animation/animation.h"
+#include "core/defer.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/math.h"
@@ -584,58 +585,47 @@ struct GLTFPlugin : AssetBrowser::IPlugin, AssetCompiler::IPlugin {
 		return result;
 	}
 	
-	void addSubresources(AssetCompiler& compiler, const Path& path) {
+	void addSubresources(AssetCompiler& compiler, const Path& path, AtomicI32& signal) {
 		compiler.addResource(Model::TYPE, path);
 		
-		struct JobData {
-			JobData(IAllocator& allocator) : meta(allocator) {}
-			GLTFPlugin* plugin;
-			Path path;
-			ModelMeta meta;
-		};
-		JobData* data = LUMIX_NEW(m_app.getAllocator(), JobData)(m_app.getAllocator());
-		data->plugin = this;
-		data->path = path;
-		data->meta.load(path, m_app);
-		jobs::run(data, [](void* ptr) {
-			JobData* data = (JobData*)ptr;
-			GLTFPlugin* plugin = data->plugin;
-			IAllocator& allocator = plugin->m_app.getAllocator();
-			FileSystem& fs = plugin->m_app.getEngine().getFileSystem();
-			AssetCompiler& compiler = plugin->m_app.getAssetCompiler();
+		ModelMeta model_meta(m_app.getAllocator());
+		model_meta.load(path, m_app);
+		signal.inc();
+		jobs::runLambda([&signal, path, this, meta = static_cast<ModelMeta&&>(model_meta)]() {
+			defer { signal.dec(); };
+			IAllocator& allocator = m_app.getAllocator();
+			FileSystem& fs = m_app.getEngine().getFileSystem();
+			AssetCompiler& compiler = m_app.getAssetCompiler();
 			
 			OutputMemoryStream content(allocator);
-			if (!fs.getContentSync(data->path, content)) {
-				logError("Could not load ", data->path);
-				LUMIX_DELETE(allocator, data);
+			if (!fs.getContentSync(path, content)) {
+				logError("Could not load ", path);
 				return;
 			}
 
 			cgltf_data* gltf_data = nullptr;
 			cgltf_options options = {};
 			if (cgltf_parse(&options, content.data(), content.size(), &gltf_data) != cgltf_result_success) {
-				logError("Failed to parse ", data->path);
-				LUMIX_DELETE(allocator, data);
+				logError("Failed to parse ", path);
 				return;
 			}
 
-			if(data->meta.split) {
+			if(meta.split) {
 				for (u32 i = 0; i < gltf_data->meshes_count; ++i) {
 					const cgltf_mesh& mesh = gltf_data->meshes[i];
 					char mesh_name[256];
-					Path tmp(mesh_name, ":", data->path);
+					Path tmp(mesh_name, ":", path);
 					compiler.addResource(Model::TYPE, tmp);
 				}
 			}
 
 			for (u32 i = 0; i < gltf_data->animations_count; ++i) {
 				const cgltf_animation& anim = gltf_data->animations[i];
-				Path tmp(anim.name, ".ani:", data->path);
+				Path tmp(anim.name, ".ani:", path);
 				compiler.addResource(Animation::TYPE, tmp);
 			}
 
 			cgltf_free(gltf_data);
-			LUMIX_DELETE(allocator, data);
 		}, &m_subres_signal, 2);		
 	}
 
