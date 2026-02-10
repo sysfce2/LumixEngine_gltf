@@ -21,8 +21,6 @@
 
 using namespace Lumix;
 
-static const ComponentType MODEL_INSTANCE_TYPE = reflection::getComponentType("model_instance");
-
 namespace {
 
 static AttributeSemantic toLumix(cgltf_attribute_type type) {
@@ -62,6 +60,87 @@ struct GLTFImporter : ModelImporter {
 			m_src_data->buffers[i].data = nullptr;
 		}
 		cgltf_free(m_src_data);
+	}
+
+	void computeNormalsIndexed(ImportGeometry& geom, const ModelMeta& meta) {
+		const u32 vertex_count = (u32)(geom.vertex_buffer.size() / geom.vertex_size);
+		if (vertex_count == 0) return;
+
+		// find normal attribute and its byte offset
+		bool found_normal_attr = false;
+		u32 normal_offset = 0;
+		for (AttributeDesc& attr : geom.attributes) {
+			if (attr.semantic == AttributeSemantic::NORMAL) {
+				found_normal_attr = true;
+				break;
+			}
+			normal_offset += gpu::getSize(attr.type) * attr.num_components;
+		}
+
+		const u32 old_vertex_size = geom.vertex_size;
+		if (!found_normal_attr) {
+			// append packed normal (u32) at the end
+			ModelImporter::AttributeDesc desc;
+			desc.semantic = AttributeSemantic::NORMAL;
+			desc.type = gpu::AttributeType::U8;
+			desc.num_components = 4;
+			geom.attributes.push(desc);
+
+			const u32 new_vertex_size = old_vertex_size + sizeof(u32);
+			OutputMemoryStream new_vb(m_allocator);
+			new_vb.resize(new_vertex_size * vertex_count);
+
+			const u8* old = geom.vertex_buffer.data();
+			u8* dst = new_vb.getMutableData();
+			for (u32 i = 0; i < vertex_count; ++i) {
+				memcpy(dst + i * new_vertex_size, old + i * old_vertex_size, old_vertex_size);
+				// zero packed normal slot
+				u32 zero = 0;
+				memcpy(dst + i * new_vertex_size + old_vertex_size, &zero, sizeof(zero));
+			}
+
+			geom.vertex_buffer = new_vb;
+			geom.vertex_size = new_vertex_size;
+
+			normal_offset = old_vertex_size;
+		}
+
+		// accumulate normals
+		Array<Vec3> acc(m_allocator);
+		acc.resize(vertex_count);
+		memset(acc.begin(), 0, acc.byte_size());
+
+		const u32* indices = geom.indices.data();
+		const u32 num_tri = (u32)(geom.indices.size() / 3);
+		const u8* vb = geom.vertex_buffer.data();
+		for (u32 t = 0; t < num_tri; ++t) {
+			const u32 i0 = indices[t * 3 + 0];
+			const u32 i1 = indices[t * 3 + 1];
+			const u32 i2 = indices[t * 3 + 2];
+
+			Vec3 v0; memcpy(&v0, vb + i0 * geom.vertex_size + 0, sizeof(v0));
+			Vec3 v1; memcpy(&v1, vb + i1 * geom.vertex_size + 0, sizeof(v1));
+			Vec3 v2; memcpy(&v2, vb + i2 * geom.vertex_size + 0, sizeof(v2));
+
+			Vec3 n = cross(v1 - v0, v2 - v0);
+			const float len = length(n);
+			if (len <= 1e-6f) continue;
+			n = n / len;
+
+			acc[i0] += n;
+			acc[i1] += n;
+			acc[i2] += n;
+		}
+
+		// write packed normals
+		for (u32 i = 0; i < vertex_count; ++i) {
+			Vec3 n = acc[i];
+			const float len = length(n);
+			if (len <= 1e-6f) n = Vec3(0, 1, 0);
+			else n = n / len;
+			u32 packed = ModelImporter::packF4u(n);
+			memcpy(geom.vertex_buffer.getMutableData() + i * geom.vertex_size + normal_offset, &packed, sizeof(packed));
+		}
 	}
 
 	template <typename T>
@@ -139,8 +218,10 @@ struct GLTFImporter : ModelImporter {
 			return false;
 		}
 
-		// TODO allocator
 		cgltf_options options = {};
+		options.memory.alloc_func = [](void* user, cgltf_size size) { return ((IAllocator*)user)->allocate(size, 8); };
+		options.memory.free_func = [](void* user, void* ptr) { ((IAllocator*)user)->deallocate(ptr); };
+		options.memory.user_data = &m_allocator;
 		if (cgltf_parse(&options, content.data(), content.size(), &m_src_data) != cgltf_result_success) {
 			logError("Could not parse ", src);
 			return false;
@@ -473,7 +554,19 @@ struct GLTFImporter : ModelImporter {
 				}
 			}
 		}
-		
+
+		// compute normals if missing or forced by meta
+		for (ImportMesh& mesh : m_meshes) {
+			ImportGeometry& geom = m_geometries[mesh.geometry_idx];
+			bool has_normal = false;
+			for (const ModelImporter::AttributeDesc& desc : geom.attributes) {
+				if (desc.semantic == AttributeSemantic::NORMAL) { has_normal = true; break; }
+			}
+			if (!has_normal || meta.force_recompute_normals) {
+				computeNormalsIndexed(geom, meta);
+			}
+		}
+
 		postprocessCommon(meta, path);
 	}
 
@@ -542,7 +635,6 @@ struct GLTFImporter : ModelImporter {
 	cgltf_data* m_src_data = nullptr;
 	Array<OutputMemoryStream> m_binaries;
 };
-
 
 struct GLTFPlugin : AssetBrowser::IPlugin, AssetCompiler::IPlugin {
 	GLTFPlugin(StudioApp& app) 
